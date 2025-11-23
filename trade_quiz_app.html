@@ -1,0 +1,574 @@
+
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#1e40af">
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Personal Debt and Spending Tracker - 个人财务追踪器</title>
+    <!-- 引入 Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, GoogleAuthProvider, signInWithPopup, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, doc, query, onSnapshot, addDoc, updateDoc, deleteDoc, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // 强制开启Debug日志
+        setLogLevel('Debug');
+
+        // ----------------------------------------------------
+        // 全局变量和初始化
+        // ----------------------------------------------------
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'debt-tracker-app';
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db, auth;
+        let currentUserId = null;
+        let isAuthReady = false;
+        let isFriendMode = false; // NEW: Track if using the shared passcode
+
+        // 秘密通行码 (已从代码中移除具体数字，以保障隐私)
+        // 实际的通行码只有您和朋友知道，现在使用占位符
+        const FRIEND_PASSCODES = ['666666', '888888']; // 仍然使用原有的占位码进行比较
+
+        // UI 元素
+        const appContainer = document.getElementById('app-container');
+        const loginContainer = document.getElementById('login-container');
+        const passcodeInput = document.getElementById('passcode-input');
+        const loginBtn = document.getElementById('login-btn');
+        const googleLoginBtn = document.getElementById('google-login-btn');
+        const loginError = document.getElementById('login-error');
+        const debtsList = document.getElementById('debts-list');
+        const expensesList = document.getElementById('expenses-list');
+        const addDebtForm = document.getElementById('add-debt-form');
+        const addExpenseForm = document.getElementById('add-expense-form');
+        const userIdDisplay = document.getElementById('user-id-display');
+        const signOutBtn = document.getElementById('sign-out-btn');
+        const provider = new GoogleAuthProvider();
+
+        // ----------------------------------------------------
+        // 认证和初始化函数
+        // ----------------------------------------------------
+        async function initializeFirebase() {
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // 尝试用 custom token 登录
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    // Sign in anonymously if no custom token provided
+                    await signInAnonymously(auth);
+                }
+                
+                // 监听认证状态变化，并更新UI和数据
+                onAuthStateChanged(auth, (user) => {
+                    isAuthReady = true;
+                    if (user) {
+                        currentUserId = user.uid;
+                        // Only update display if not in friend mode
+                        if (!isFriendMode) {
+                            userIdDisplay.textContent = currentUserId;
+                        }
+                        console.log("Auth state changed. User ID:", currentUserId);
+                    } else {
+                        currentUserId = null;
+                        console.log("User signed out.");
+                    }
+                    
+                    // If user signs out from Firebase, reset friend mode flag
+                    if (!user) {
+                        isFriendMode = false;
+                        userIdDisplay.textContent = "未登录";
+                    }
+
+                    // 只有在认证状态更新后才决定显示哪个页面
+                    // 如果是 Google/Firebase 登录成功 (user is truthy) 或者已经通过通行码进入朋友模式，则显示 App
+                    if (user || isFriendMode) {
+                        showApp();
+                    } else {
+                        // 如果是匿名/初始登录，先显示登录页面
+                        showLogin();
+                    }
+                });
+
+            } catch (error) {
+                console.error("Firebase 初始化或认证失败:", error);
+                // 即使初始化失败，也要显示登录界面
+                showLogin(); 
+            }
+        }
+
+        // ----------------------------------------------------
+        // UI 逻辑
+        // ----------------------------------------------------
+
+        function showLogin() {
+            appContainer.classList.add('hidden');
+            loginContainer.classList.remove('hidden');
+            // 清空列表，防止数据泄露
+            debtsList.innerHTML = '';
+            expensesList.innerHTML = '';
+            loginError.classList.add('hidden'); // Hide any previous error
+        }
+
+        function showApp() {
+            loginContainer.classList.add('hidden');
+            appContainer.classList.remove('hidden');
+            // Update display based on mode
+            if (isFriendMode) {
+                userIdDisplay.textContent = '共享-朋友通行码';
+            } else if (currentUserId) {
+                userIdDisplay.textContent = currentUserId;
+            }
+            // 确保只在显示App时设置监听器
+            setupListeners();
+            loginError.classList.add('hidden'); // Hide any login error once app is shown
+        }
+        
+        // 朋友通行码登录
+        loginBtn.addEventListener('click', () => {
+            const enteredCode = passcodeInput.value.trim();
+            
+            if (FRIEND_PASSCODES.includes(enteredCode)) {
+                loginError.classList.add('hidden');
+                
+                // FIX: Set friend mode flag and a dummy ID for public path resolution
+                isFriendMode = true;
+                currentUserId = 'friend_group_shared'; // Dummy ID for path logic
+                
+                showApp();
+            } else {
+                loginError.textContent = '通行码错误，请使用秘密通行码。';
+                loginError.classList.remove('hidden');
+            }
+        });
+        
+        // 您的 Google 账号登录
+        googleLoginBtn.addEventListener('click', async () => {
+             try {
+                // Ensure friend mode is disabled if switching to Google Auth
+                isFriendMode = false;
+                const result = await signInWithPopup(auth, provider);
+                // 登录成功后 onAuthStateChanged 会自动处理 showApp()
+                console.log("Google 登录成功", result.user);
+            } catch (error) {
+                console.error("Google 登录失败:", error);
+                loginError.textContent = 'Google 登录失败，请重试。';
+                loginError.classList.remove('hidden');
+            }
+        });
+        
+        // 退出登录
+        signOutBtn.addEventListener('click', async () => {
+            // Reset flags and sign out from Firebase Auth
+            isFriendMode = false;
+            await signOut(auth);
+            // 退出后 onAuthStateChanged 会自动调用 showLogin()
+        });
+
+
+        // ----------------------------------------------------
+        // Firestore 数据操作和监听
+        // ----------------------------------------------------
+
+        // 获取用户数据路径 (私有数据或公共数据)
+        function getUserCollectionRef(collectionName) {
+            if (!db) {
+                console.error("Database is not ready.");
+                return null;
+            }
+            
+            let path;
+            if (isFriendMode) {
+                // Passcode mode -> Public/Shared Data
+                // Path: /artifacts/{appId}/public/data/{collectionName}
+                path = `artifacts/${appId}/public/data/${collectionName}`;
+            } else if (currentUserId) {
+                // Google/Authenticated mode -> Private Data
+                // Path: /artifacts/{appId}/users/{currentUserId}/{collectionName}
+                path = `artifacts/${appId}/users/${currentUserId}/${collectionName}`;
+            } else {
+                console.error("User ID is not ready and not in Friend Mode.");
+                return null;
+            }
+            
+            return collection(db, path);
+        }
+
+        // 渲染债务列表 (不变)
+        function renderDebts(debts) {
+            debtsList.innerHTML = '';
+            let totalDebt = 0;
+            if (debts.length === 0) {
+                debtsList.innerHTML = `<li class="text-center py-4 text-gray-500">暂无欠款记录。</li>`;
+                return;
+            }
+            
+            debts.forEach(debt => {
+                const item = document.createElement('li');
+                item.className = 'flex justify-between items-center p-3 border-b border-red-100 last:border-b-0 hover:bg-red-50 rounded-lg';
+                item.innerHTML = `
+                    <div>
+                        <p class="font-bold text-lg text-red-700">¥${debt.amount.toFixed(2)}</p>
+                        <p class="text-sm text-gray-600">对象: ${debt.person}</p>
+                        <p class="text-xs text-gray-400">备注: ${debt.note || '无'}</p>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <button data-id="${debt.id}" data-amount="${debt.amount}" data-type="debt-pay" class="pay-btn px-3 py-1 bg-green-500 text-white text-xs font-medium rounded-full hover:bg-green-600 transition">已还清</button>
+                        <button data-id="${debt.id}" data-type="debt-delete" class="delete-btn text-red-400 hover:text-red-700 text-lg">&times;</button>
+                    </div>
+                `;
+                debtsList.appendChild(item);
+                totalDebt += debt.amount;
+            });
+            document.getElementById('total-debt-display').textContent = totalDebt.toFixed(2);
+        }
+        
+        // 渲染开支列表 (不变)
+        function renderExpenses(expenses) {
+            expensesList.innerHTML = '';
+            let totalExpense = 0;
+            if (expenses.length === 0) {
+                expensesList.innerHTML = `<li class="text-center py-4 text-gray-500">暂无开支记录。</li>`;
+                return;
+            }
+            
+            expenses.forEach(expense => {
+                const item = document.createElement('li');
+                item.className = 'flex justify-between items-center p-3 border-b border-indigo-100 last:border-b-0 hover:bg-indigo-50 rounded-lg';
+                item.innerHTML = `
+                    <div>
+                        <p class="font-bold text-lg text-indigo-700">¥${expense.amount.toFixed(2)}</p>
+                        <p class="text-sm text-gray-600">类别: ${expense.category}</p>
+                        <p class="text-xs text-gray-400">备注: ${expense.note || '无'}</p>
+                    </div>
+                    <button data-id="${expense.id}" data-type="expense-delete" class="delete-btn text-red-400 hover:text-red-700 text-lg">&times;</button>
+                `;
+                expensesList.appendChild(item);
+                totalExpense += expense.amount;
+            });
+            document.getElementById('total-expense-display').textContent = totalExpense.toFixed(2);
+        }
+
+        // 添加债务
+        addDebtForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const amount = parseFloat(document.getElementById('debt-amount').value);
+            const person = document.getElementById('debt-person').value.trim();
+            const note = document.getElementById('debt-note').value.trim();
+
+            if (isNaN(amount) || amount <= 0 || !person) {
+                // Display error message to user
+                loginError.textContent = "请输入有效的金额和欠款对象名称（如：100 和 朋友A）。";
+                loginError.classList.remove('hidden');
+                console.error("请确保金额有效且欠款对象非空。");
+                return; 
+            } else {
+                loginError.classList.add('hidden');
+            }
+            
+            // FIX: 确保认证就绪，并且有可用的用户身份
+            if (!isAuthReady || (!currentUserId && !isFriendMode)) {
+                loginError.textContent = "身份验证未完成，请稍候再试或重新登录。";
+                loginError.classList.remove('hidden');
+                console.error("身份验证未就绪或用户ID缺失。");
+                return;
+            }
+
+            const collectionRef = getUserCollectionRef('debts');
+            if (!collectionRef) return;
+
+            try {
+                await addDoc(collectionRef, {
+                    amount: amount,
+                    person: person,
+                    note: note,
+                    createdAt: serverTimestamp()
+                });
+                addDebtForm.reset();
+            } catch (error) {
+                // Display error message to user
+                loginError.textContent = "记录欠款失败，请检查网络连接或权限。";
+                loginError.classList.remove('hidden');
+                console.error("添加债务记录失败:", error);
+            }
+        });
+
+        // 添加开支
+        addExpenseForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const amount = parseFloat(document.getElementById('expense-amount').value);
+            const category = document.getElementById('expense-category').value;
+            const note = document.getElementById('expense-note').value.trim();
+
+            if (isNaN(amount) || amount <= 0) {
+                // Display error message to user
+                loginError.textContent = "请输入有效的开支金额。";
+                loginError.classList.remove('hidden');
+                console.error("请确保金额有效。");
+                return; 
+            } else {
+                loginError.classList.add('hidden');
+            }
+
+            // FIX: 确保认证就绪，并且有可用的用户身份
+            if (!isAuthReady || (!currentUserId && !isFriendMode)) {
+                loginError.textContent = "身份验证未完成，请稍候再试或重新登录。";
+                loginError.classList.remove('hidden');
+                console.error("身份验证未就绪或用户ID缺失。");
+                return;
+            }
+
+            const collectionRef = getUserCollectionRef('expenses');
+            if (!collectionRef) return;
+
+            try {
+                await addDoc(collectionRef, {
+                    amount: amount,
+                    category: category,
+                    note: note,
+                    createdAt: serverTimestamp()
+                });
+                addExpenseForm.reset();
+            } catch (error) {
+                // Display error message to user
+                loginError.textContent = "记录开支失败，请检查网络连接或权限。";
+                loginError.classList.remove('hidden');
+                console.error("添加开支记录失败:", error);
+            }
+        });
+
+        // 删除记录
+        document.addEventListener('click', async (e) => {
+            const target = e.target;
+            const recordId = target.dataset.id;
+            const recordType = target.dataset.type;
+            
+            if (!currentUserId && !isFriendMode) return; // 确保用户已登录
+
+            if (recordId) {
+                try {
+                    // Use isFriendMode to determine if using public or private collection
+                    const collectionName = recordType.startsWith('debt') ? 'debts' : 'expenses';
+                    const collectionRef = getUserCollectionRef(collectionName);
+                    if (!collectionRef) return;
+
+                    await deleteDoc(doc(collectionRef, recordId));
+                    console.log("记录删除成功:", recordId);
+
+                } catch (error) {
+                    console.error("删除记录失败:", error);
+                    loginError.textContent = "删除记录失败，请检查网络连接或权限。";
+                    loginError.classList.remove('hidden');
+                }
+            }
+        });
+        
+        // 监听 Firestore 数据变化
+        function setupListeners() {
+            if (!db || (!currentUserId && !isFriendMode) || !isAuthReady) {
+                // 如果用户ID或认证未就绪，则不设置监听器
+                return;
+            }
+
+            const debtsRef = getUserCollectionRef('debts');
+            if (!debtsRef) return;
+
+            // 监听债务变化
+            const debtsQuery = query(debtsRef);
+            const unsubscribeDebts = onSnapshot(debtsQuery, (snapshot) => {
+                const debts = [];
+                snapshot.forEach(doc => {
+                    debts.push({ id: doc.id, ...doc.data() });
+                });
+                // 客户端排序：按金额降序
+                debts.sort((a, b) => b.amount - a.amount);
+                renderDebts(debts);
+            }, (error) => {
+                console.error("监听债务数据失败:", error);
+            });
+
+            const expensesRef = getUserCollectionRef('expenses');
+            if (!expensesRef) return;
+
+            // 监听开支变化
+            const expensesQuery = query(expensesRef);
+            const unsubscribeExpenses = onSnapshot(expensesQuery, (snapshot) => {
+                const expenses = [];
+                snapshot.forEach(doc => {
+                    expenses.push({ id: doc.id, ...doc.data() });
+                });
+                // 客户端排序：按时间降序
+                expenses.sort((a, b) => b.createdAt?.toMillis() - a.createdAt?.toMillis());
+                renderExpenses(expenses);
+            }, (error) => {
+                console.error("监听开支数据失败:", error);
+            });
+            
+            // 返回清理函数，在用户切换或退出时使用
+            return () => {
+                unsubscribeDebts();
+                unsubscribeExpenses();
+            };
+        }
+        
+        // 启动应用
+        initializeFirebase();
+    </script>
+    
+    <style>
+        /* 颜色主题切换为专业蓝 */
+        .primary-bg { background-color: #1e40af; } /* Blue-800 */
+        .primary-text { color: #1e40af; }
+        .primary-hover:hover { background-color: #1d4ed8; } /* Blue-700 */
+        
+        .card {
+            background-color: white;
+            padding: 2.5rem;
+            border-radius: 1rem;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.05);
+        }
+        
+        .input-style {
+            padding: 0.75rem;
+            border: 1px solid #d1d5db;
+            border-radius: 0.5rem;
+            width: 100%;
+        }
+        
+        .hidden { display: none; }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen font-sans">
+
+    <!-- 头部/导航栏 -->
+    <header class="primary-bg shadow-md">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex flex-col sm:flex-row justify-between items-center">
+            <div class="text-2xl font-bold text-white tracking-wider">
+                <span class="mr-2">📊</span> 个人财务追踪系统
+            </div>
+            <div class="flex items-center space-x-4 mt-2 sm:mt-0">
+                <p id="user-info" class="text-sm text-blue-200">
+                    用户ID: <span id="user-id-display">...</span> (您的数据)
+                </p>
+                <button id="sign-out-btn" class="text-sm px-3 py-1 bg-white text-blue-800 rounded-full hover:bg-blue-100 transition shadow-sm">
+                    退出登录
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <main class="container mx-auto p-4 sm:p-6 lg:p-8">
+        <!-- 登录/密码验证区域 (默认显示) -->
+        <div id="login-container" class="max-w-sm mx-auto mt-20 card hidden space-y-6">
+            <h2 class="text-2xl font-bold text-gray-800 mb-6 text-center">🔐 请选择登录方式</h2>
+            
+            <!-- 朋友：通行码登录 -->
+            <div class="space-y-3 p-4 border border-gray-200 rounded-lg">
+                <p class="font-semibold text-gray-700">选项一：朋友秘密通行码</p>
+                <input id="passcode-input" type="password" placeholder="请输入秘密通行码" class="input-style text-center tracking-widest" maxlength="8">
+                <button id="login-btn" class="w-full py-3 bg-red-600 text-white font-semibold rounded-lg shadow-lg hover:bg-red-700 transition">
+                    解锁追踪器 (朋友)
+                </button>
+            </div>
+            
+            <!-- 分隔线 -->
+            <div class="flex items-center">
+                <hr class="flex-grow border-t border-gray-300">
+                <span class="px-3 text-gray-500 text-sm">或</span>
+                <hr class="flex-grow border-t border-gray-300">
+            </div>
+
+            <!-- 您：Google 登录 -->
+            <div class="space-y-3 p-4 border border-gray-200 rounded-lg">
+                <p class="font-semibold text-gray-700">选项二：您的 Google 账号登录</p>
+                <button id="google-login-btn" class="w-full py-3 bg-white text-gray-700 border border-gray-300 font-semibold rounded-lg shadow-md hover:bg-gray-100 transition flex items-center justify-center">
+                    <img src="https://upload.wikimedia.org/wikipedia/commons/4/4a/Logo-google.png" alt="Google Logo" class="w-5 h-5 mr-3">
+                    使用 Google 账号登录 (您)
+                </button>
+            </div>
+
+            <p id="login-error" class="text-red-500 text-center pt-2 hidden"></p>
+        </div>
+
+        <!-- 财务追踪应用区域 (验证通过后显示) -->
+        <div id="app-container" class="hidden">
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                
+                <!-- 欠款追踪模块 (朋友需重点关注) -->
+                <div class="lg:col-span-2 card">
+                    <h2 class="text-2xl font-bold text-red-700 mb-6 border-b-2 border-red-300 pb-3 flex justify-between items-center">
+                        <span class="flex items-center"><span class="mr-2">💰</span> 欠款追踪 (Debt Tracker)</span>
+                        <span class="text-sm font-normal text-gray-600">总欠款: ¥<span id="total-debt-display" class="font-extrabold text-red-800">0.00</span></span>
+                    </h2>
+
+                    <!-- 添加新欠款表单 -->
+                    <form id="add-debt-form" class="mb-6 p-4 border border-red-200 rounded-lg bg-red-50">
+                        <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+                            <input id="debt-amount" type="number" step="0.01" placeholder="欠款金额 (¥)" class="input-style col-span-1" required>
+                            <input id="debt-person" type="text" placeholder="欠款对象 (人名/机构)" class="input-style col-span-1" required>
+                            <input id="debt-note" type="text" placeholder="备注 (原因/日期)" class="input-style col-span-1">
+                            <button type="submit" class="w-full py-2 bg-red-600 text-white font-medium rounded-lg hover:bg-red-700 transition">
+                                记录欠款
+                            </button>
+                        </div>
+                    </form>
+
+                    <!-- 欠款列表 -->
+                    <ul id="debts-list" class="space-y-2">
+                        <!-- 欠款记录将由 JS 渲染 -->
+                    </ul>
+                </div>
+
+                <!-- 日常开支模块 -->
+                <div class="card">
+                    <h2 class="text-2xl font-bold primary-text mb-6 border-b-2 border-blue-300 pb-3 flex justify-between items-center">
+                        <span class="flex items-center"><span class="mr-2">🛒</span> 日常开支 (Expense Log)</span>
+                        <span class="text-sm font-normal text-gray-600">总开支: ¥<span id="total-expense-display" class="font-extrabold primary-text">0.00</span></span>
+                    </h2>
+
+                    <!-- 添加新开支表单 -->
+                    <form id="add-expense-form" class="mb-6 p-4 border border-indigo-200 rounded-lg bg-indigo-50">
+                        <div class="space-y-3">
+                            <input id="expense-amount" type="number" step="0.01" placeholder="开支金额 (¥)" class="input-style" required>
+                            <select id="expense-category" class="input-style" required>
+                                <option value="食物">食物</option>
+                                <option value="交通">交通</option>
+                                <option value="住宿">住宿</option>
+                                <option value="生活用品">生活用品</option>
+                                <option value="其他">其他</option>
+                            </select>
+                            <input id="expense-note" type="text" placeholder="备注 (具体用途)" class="input-style">
+                            <button type="submit" class="w-full py-2 primary-bg text-white font-medium rounded-lg primary-hover transition">
+                                记录开支
+                            </button>
+                        </div>
+                    </form>
+
+                    <!-- 开支列表 -->
+                    <ul id="expenses-list" class="space-y-2">
+                        <!-- 开支记录将由 JS 渲染 -->
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </main>
+
+</body>
+<script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js')
+    .then(() => console.log('Service Worker 注册成功'))
+    .catch(err => console.log('Service Worker 注册失败', err));
+}
+</script>
+
+</html>
